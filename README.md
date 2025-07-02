@@ -24,7 +24,7 @@ A modern, colorful command-line tool to monitor SSL certificate expiration for m
 ### Super Simple Setup
 ```bash
 # 1. Download the single file
-wget https://raw.githubusercontent.com/your-repo/sslcheck.py
+wget https://raw.githubusercontent.com/i04n/sslcheck/main/sslcheck.py
 
 # 2. Install the only dependency
 pip install pyOpenSSL
