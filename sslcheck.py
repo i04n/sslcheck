@@ -29,6 +29,8 @@ from threading import Thread, Lock
 from queue import Queue
 import concurrent.futures
 import itertools
+import configparser
+import logging
 
 # Color codes for terminal output
 class Colors:
@@ -62,6 +64,72 @@ DEFAULT_PORT = 443
 # Spinner characters for loading animation
 SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
+def load_config(config_file=None):
+    """Load configuration from file"""
+    config = configparser.ConfigParser()
+    
+    # Default configuration file locations
+    config_files = []
+    if config_file:
+        config_files.append(config_file)
+    
+    # Check for config file in home directory
+    home_config = os.path.expanduser('~/sslcheck.conf')
+    if os.path.exists(home_config):
+        config_files.append(home_config)
+    
+    # Check for config file in current directory
+    local_config = 'sslcheck.conf'
+    if os.path.exists(local_config):
+        config_files.append(local_config)
+    
+    if config_files:
+        config.read(config_files)
+        return config
+    
+    return None
+
+def parse_domains_from_config(config):
+    """Parse domains from configuration"""
+    domains = []
+    if config:
+        # Check DEFAULT section or fall back to default values
+        if config.has_option('DEFAULT', 'domains'):
+            domains_str = config.get('DEFAULT', 'domains')
+            domains = [d.strip() for d in domains_str.split(',') if d.strip()]
+    return domains
+
+def get_alert_days_from_config(config):
+    """Get alert days from configuration"""
+    if config:
+        # Check DEFAULT section or fall back to default values
+        if config.has_option('DEFAULT', 'alert_days'):
+            try:
+                return int(config.get('DEFAULT', 'alert_days'))
+            except ValueError:
+                pass
+    return DAYS_THRESHOLD
+
+def setup_logging(log_file=None):
+    """Setup logging configuration"""
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    
+    if log_file:
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[logging.StreamHandler()]
+        )
+
 def get_certificate_expiry(domain, port=DEFAULT_PORT):
     try:
         cert = ssl.get_server_certificate((domain, port))
@@ -92,17 +160,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 📋 Usage Examples:
-  %(prog)s -f domains.txt
-  %(prog)s -f sites.txt -t 30 -p 443
-  %(prog)s --create-sample
-  %(prog)s -f domains.txt --no-color
+  sslcheck -f domains.txt
+  sslcheck -d example.com google.com
+  sslcheck -d example.com -a 30
+  sslcheck -c /path/to/custom.conf
+  sslcheck -f sites.txt -t 30 -p 443
+  sslcheck --create-sample
+  sslcheck -f domains.txt --no-color --log-file /var/log/sslcheck.log
         """
     )
     
     parser.add_argument("-f", "--file", 
                        help="File containing list of domains (one per line)")
-    parser.add_argument("-t", "--threshold", type=int, default=DAYS_THRESHOLD,
+    parser.add_argument("-d", "--domains", nargs='+',
+                       help="List of domains to check (space-separated)")
+    parser.add_argument("-c", "--config",
+                       help="Custom configuration file path")
+    parser.add_argument("-t", "--threshold", type=int,
                        help=f"Days threshold to consider as expiring soon (default: {DAYS_THRESHOLD})")
+    parser.add_argument("-a", "--alert", type=int,
+                       help="Alias for --threshold (days before expiration to alert)")
     parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
                        help=f"SSL port to check (default: {DEFAULT_PORT})")
     parser.add_argument("--create-sample", action="store_true",
@@ -111,8 +188,14 @@ def main():
                        help="Disable colored output")
     parser.add_argument("-w", "--workers", type=int, default=10,
                        help="Number of concurrent workers (default: 10)")
+    parser.add_argument("--log-file",
+                       help="Log file path for cron job integration")
     
     args = parser.parse_args()
+    
+    # Setup logging if specified
+    if args.log_file:
+        setup_logging(args.log_file)
     
     if args.no_color:
         Colors.disable()
@@ -121,30 +204,50 @@ def main():
         create_sample_domains_file("domains.txt")
         return
     
-    if not args.file:
-        print(f"{Colors.RED}❌ Error:{Colors.END} You must specify a domains file using -f/--file")
-        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --help to see available options")
-        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --create-sample to create an example file")
-        sys.exit(1)
+    # Load configuration
+    config = load_config(args.config)
     
-    if not os.path.exists(args.file):
-        print(f"{Colors.RED}❌ Error:{Colors.END} File '{Colors.CYAN}{args.file}{Colors.END}' not found")
-        sys.exit(1)
+    # Determine threshold (priority: command line > config > default)
+    threshold = args.threshold or args.alert
+    if threshold is None:
+        threshold = get_alert_days_from_config(config)
     
-    try:
-        with open(args.file, "r") as file:
-            domains = [line.strip() for line in file.readlines() if line.strip()]
-    except Exception as e:
-        print(f"{Colors.RED}❌ Error reading file:{Colors.END} {e}")
-        sys.exit(1)
+    # Determine domains to check
+    domains = []
+    
+    # Priority: command line domains > file > config
+    if args.domains:
+        domains = args.domains
+    elif args.file:
+        if not os.path.exists(args.file):
+            print(f"{Colors.RED}❌ Error:{Colors.END} File '{Colors.CYAN}{args.file}{Colors.END}' not found")
+            sys.exit(1)
+        try:
+            with open(args.file, "r") as file:
+                domains = [line.strip() for line in file.readlines() if line.strip()]
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error reading file:{Colors.END} {e}")
+            sys.exit(1)
+    else:
+        # Try to get domains from config
+        domains = parse_domains_from_config(config)
     
     if not domains:
-        print(f"{Colors.RED}❌ Error:{Colors.END} File '{Colors.CYAN}{args.file}{Colors.END}' is empty or contains no valid domains")
+        print(f"{Colors.RED}❌ Error:{Colors.END} No domains specified")
+        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use -d, --domains, -f, --file, or configure domains in sslcheck.conf")
+        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --create-sample to create an example file")
+        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --help to see available options")
         sys.exit(1)
+    
+    # Log the start of the check
+    if args.log_file:
+        logging.info(f"SSL Certificate check started for {len(domains)} domains")
+        logging.info(f"Domains: {', '.join(domains)}")
+        logging.info(f"Port: {args.port}, Threshold: {threshold} days")
     
     print(f"{Colors.BOLD}{Colors.BLUE}🔒 SSL Certificate Checker{Colors.END}")
     print(f"{Colors.CYAN}📋 Checking {len(domains)} domain(s) on port {args.port}{Colors.END}")
-    print(f"{Colors.YELLOW}⚠️  Warning threshold: {args.threshold} days{Colors.END}")
+    print(f"{Colors.YELLOW}⚠️  Warning threshold: {threshold} days{Colors.END}")
     print(f"{Colors.MAGENTA}👥 Using {args.workers} concurrent workers{Colors.END}")
     print("═" * 80)
     
@@ -279,7 +382,7 @@ def main():
                 status_icon = "🔴"
                 status_text = "EXPIRED"
                 expired_count += 1
-            elif days_remaining <= args.threshold:
+            elif days_remaining <= threshold:
                 status_color = Colors.YELLOW
                 status_icon = "🟡"
                 status_text = "EXPIRING SOON"
@@ -348,6 +451,23 @@ def main():
     print("─" * 80)
     print(f"{Colors.BOLD}OVERALL STATUS: {health_status}{Colors.END}")
     print("═" * 80)
+    
+    # Log the results
+    if args.log_file:
+        logging.info(f"SSL Certificate check completed")
+        logging.info(f"Results: {valid_count} valid, {warning_count} expiring soon, {expired_count} expired, {error_count} errors")
+        
+        # Log details for problematic certificates
+        for result in results:
+            if result['error']:
+                logging.error(f"{result['domain']}: {result['error']}")
+            elif result['days_remaining'] is not None:
+                if result['days_remaining'] <= 0:
+                    logging.critical(f"{result['domain']}: Certificate EXPIRED on {result['expiry_date']}")
+                elif result['days_remaining'] <= threshold:
+                    logging.warning(f"{result['domain']}: Certificate expires in {result['days_remaining']} days on {result['expiry_date']}")
+                else:
+                    logging.info(f"{result['domain']}: Certificate valid for {result['days_remaining']} days (expires {result['expiry_date']})")
 
 if __name__ == "__main__":
     main()
