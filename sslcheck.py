@@ -43,6 +43,7 @@ class Colors:
     WHITE = '\033[97m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+    GRAY = '\033[90m'
     END = '\033[0m'
     
     @staticmethod
@@ -56,6 +57,7 @@ class Colors:
         Colors.WHITE = ''
         Colors.BOLD = ''
         Colors.UNDERLINE = ''
+        Colors.GRAY = ''
         Colors.END = ''
 
 DAYS_THRESHOLD = 15  # Days threshold to consider as "expiring soon"
@@ -249,7 +251,7 @@ def main():
     print(f"{Colors.CYAN}📋 Checking {len(domains)} domain(s) on port {args.port}{Colors.END}")
     print(f"{Colors.YELLOW}⚠️  Warning threshold: {threshold} days{Colors.END}")
     print(f"{Colors.MAGENTA}👥 Using {args.workers} concurrent workers{Colors.END}")
-    print("═" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     
     current_date = datetime.now().date()
     results = []
@@ -359,9 +361,9 @@ def main():
             for _ in range(update_display.lines_printed):
                 print(f"\033[1A\033[2K", end="")  # Move up one line and clear it
     
-    print("\n" + "═" * 80)
+    print("\n" + f"{Colors.GRAY}─" * 80+f"{Colors.END}")
     print(f"{Colors.BOLD}{Colors.BLUE}📊 RESULTS{Colors.END}")
-    print("═" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     
     valid_count = expired_count = warning_count = error_count = 0
     
@@ -395,7 +397,7 @@ def main():
             
             print(f"{status_icon} {domain:30} {status_color}{status_text:15}{Colors.END} Expires: {expiry_date} ({days_remaining} days)")
     
-    print("═" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     
     # Calculate percentages
     total = len(domains)
@@ -405,7 +407,7 @@ def main():
     error_pct = (error_count / total * 100) if total > 0 else 0
     
     print(f"{Colors.BOLD}{Colors.CYAN}📊 CERTIFICATE HEALTH SUMMARY{Colors.END}")
-    print("═" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     
     # Status bars
     def create_status_bar(count, total, color):
@@ -448,9 +450,9 @@ def main():
     else:
         health_status = f"{Colors.GREEN}✅ ALL CERTIFICATES HEALTHY{Colors.END}"
     
-    print("─" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     print(f"{Colors.BOLD}OVERALL STATUS: {health_status}{Colors.END}")
-    print("═" * 80)
+    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
     
     # Log the results
     if args.log_file:
