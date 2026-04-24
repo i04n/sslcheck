@@ -25,12 +25,13 @@ import argparse
 import sys
 import os
 import time
+import json
 from threading import Thread, Lock
 import concurrent.futures
 import configparser
 import logging
 
-# Color codes for terminal output
+
 class Colors:
     RED = '\033[91m'
     GREEN = '\033[92m'
@@ -43,7 +44,7 @@ class Colors:
     UNDERLINE = '\033[4m'
     GRAY = '\033[90m'
     END = '\033[0m'
-    
+
     @staticmethod
     def disable():
         Colors.RED = ''
@@ -58,417 +59,410 @@ class Colors:
         Colors.GRAY = ''
         Colors.END = ''
 
-DAYS_THRESHOLD = 15  # Days threshold to consider as "expiring soon"
-DEFAULT_PORT = 443
 
-# Spinner characters for loading animation
+DAYS_THRESHOLD = 15
+DEFAULT_PORT = 443
+CONNECT_TIMEOUT = 10
+
 SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
 
 def load_config(config_file=None):
     """Load configuration from file"""
     config = configparser.ConfigParser()
-    
-    # Default configuration file locations
     config_files = []
     if config_file:
         config_files.append(config_file)
-    
-    # Check for config file in home directory
     home_config = os.path.expanduser('~/sslcheck.conf')
     if os.path.exists(home_config):
         config_files.append(home_config)
-    
-    # Check for config file in current directory
     local_config = 'sslcheck.conf'
     if os.path.exists(local_config):
         config_files.append(local_config)
-    
     if config_files:
         config.read(config_files)
         return config
-    
     return None
 
+
 def parse_domains_from_config(config):
-    """Parse domains from configuration"""
     domains = []
-    if config:
-        # Check DEFAULT section or fall back to default values
-        if config.has_option('DEFAULT', 'domains'):
-            domains_str = config.get('DEFAULT', 'domains')
-            domains = [d.strip() for d in domains_str.split(',') if d.strip()]
+    if config and config.has_option('DEFAULT', 'domains'):
+        domains_str = config.get('DEFAULT', 'domains')
+        domains = [d.strip() for d in domains_str.split(',') if d.strip()]
     return domains
 
+
 def get_alert_days_from_config(config):
-    """Get alert days from configuration"""
-    if config:
-        # Check DEFAULT section or fall back to default values
-        if config.has_option('DEFAULT', 'alert_days'):
-            try:
-                return int(config.get('DEFAULT', 'alert_days'))
-            except ValueError:
-                pass
+    if config and config.has_option('DEFAULT', 'alert_days'):
+        try:
+            return int(config.get('DEFAULT', 'alert_days'))
+        except ValueError:
+            pass
     return DAYS_THRESHOLD
 
-def setup_logging(log_file=None):
-    """Setup logging configuration"""
-    log_format = '%(asctime)s - %(levelname)s - %(message)s'
-    
-    if log_file:
-        logging.basicConfig(
-            level=logging.INFO,
-            format=log_format,
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format=log_format,
-            handlers=[logging.StreamHandler()]
-        )
+
+def setup_logging(log_file):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.FileHandler(log_file)],
+    )
+
+
+def _asn1_len(data, i):
+    """Parse an ASN.1 DER length starting at offset i. Returns (length, next_offset)."""
+    b = data[i]
+    i += 1
+    if b < 0x80:
+        return b, i
+    n = b & 0x7F
+    length = 0
+    for _ in range(n):
+        length = (length << 8) | data[i]
+        i += 1
+    return length, i
+
+
+def _asn1_skip(data, i):
+    """Skip one ASN.1 TLV element. Returns offset past the element."""
+    i += 1
+    length, i = _asn1_len(data, i)
+    return i + length
+
+
+def _extract_not_after(der):
+    """Extract notAfter date from an X.509 DER-encoded certificate."""
+    i = 0
+    if der[i] != 0x30:
+        raise ValueError("expected outer SEQUENCE")
+    _, i = _asn1_len(der, i + 1)
+    if der[i] != 0x30:
+        raise ValueError("expected tbsCertificate SEQUENCE")
+    _, i = _asn1_len(der, i + 1)
+    if der[i] == 0xA0:  # [0] EXPLICIT version, optional
+        i = _asn1_skip(der, i)
+    i = _asn1_skip(der, i)  # serialNumber
+    i = _asn1_skip(der, i)  # signature AlgorithmIdentifier
+    i = _asn1_skip(der, i)  # issuer
+    if der[i] != 0x30:
+        raise ValueError("expected validity SEQUENCE")
+    _, i = _asn1_len(der, i + 1)
+    i = _asn1_skip(der, i)  # notBefore
+    tag = der[i]
+    i += 1
+    length, i = _asn1_len(der, i)
+    time_str = der[i:i + length].decode('ascii')
+    if tag == 0x17:  # UTCTime: YYMMDDHHMMSSZ
+        return datetime.strptime(time_str, '%y%m%d%H%M%SZ').date()
+    if tag == 0x18:  # GeneralizedTime: YYYYMMDDHHMMSSZ
+        return datetime.strptime(time_str, '%Y%m%d%H%M%SZ').date()
+    raise ValueError(f"unexpected time tag 0x{tag:02x}")
+
 
 def get_certificate_expiry(domain, port=DEFAULT_PORT):
     try:
         context = ssl.create_default_context()
-        with socket.create_connection((domain, port), timeout=10) as sock:
+        with socket.create_connection((domain, port), timeout=CONNECT_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-        expiry_date = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z').date()
-        return expiry_date, None
+        return datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z').date(), None
+    except ssl.SSLCertVerificationError:
+        pass  # fall through — retry unverified so we can still read notAfter
     except (ssl.SSLError, socket.timeout, ConnectionError, OSError, ValueError, KeyError) as e:
         return None, str(e)
 
+    # Verification failed (expired / self-signed / hostname mismatch / untrusted CA).
+    # Fetch the raw DER without validation and parse notAfter so we can report
+    # EXPIRED/EXPIRING instead of a generic error.
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((domain, port), timeout=CONNECT_TIMEOUT) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+        if not der:
+            return None, "server presented no certificate"
+        return _extract_not_after(der), None
+    except (ssl.SSLError, socket.timeout, ConnectionError, OSError, ValueError, KeyError, IndexError) as e:
+        return None, str(e)
+
+
 def create_sample_domains_file(filename):
-    sample_domains = [
-        "google.com",
-        "github.com",
-        "stackoverflow.com",
-        "cloudflare.com",
-        "mozilla.org"
-    ]
+    sample_domains = ["google.com", "github.com", "stackoverflow.com", "cloudflare.com", "mozilla.org"]
     with open(filename, "w") as file:
         for domain in sample_domains:
             file.write(f"{domain}\n")
     print(f"{Colors.GREEN}✓{Colors.END} Sample domains file created: {Colors.CYAN}{filename}{Colors.END}")
 
+
+def classify(days_remaining, error, threshold):
+    if error:
+        return 'error'
+    if days_remaining <= 0:
+        return 'expired'
+    if days_remaining <= threshold:
+        return 'expiring'
+    return 'valid'
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="🔒 SSL Certificate Checker - Monitor SSL certificate expiration for multiple domains",
+        description="SSL Certificate Checker — monitor SSL certificate expiration across multiple domains",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-📋 Usage Examples:
+Examples:
   sslcheck -f domains.txt
   sslcheck -d example.com google.com
   sslcheck -d example.com -a 30
   sslcheck -c /path/to/custom.conf
   sslcheck -f sites.txt -t 30 -p 443
+  sslcheck -d example.com --json | jq '.[] | select(.days_remaining < 30)'
   sslcheck --create-sample
-  sslcheck -f domains.txt --no-color --log-file /var/log/sslcheck.log
+  sslcheck -f domains.txt --log-file /var/log/sslcheck.log
         """
     )
-    
-    parser.add_argument("-f", "--file", 
-                       help="File containing list of domains (one per line)")
-    parser.add_argument("-d", "--domains", nargs='+',
-                       help="List of domains to check (space-separated)")
-    parser.add_argument("-c", "--config",
-                       help="Custom configuration file path")
-    parser.add_argument("-t", "--threshold", type=int,
-                       help=f"Days threshold to consider as expiring soon (default: {DAYS_THRESHOLD})")
-    parser.add_argument("-a", "--alert", type=int,
-                       help="Alias for --threshold (days before expiration to alert)")
-    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
-                       help=f"SSL port to check (default: {DEFAULT_PORT})")
-    parser.add_argument("--create-sample", action="store_true",
-                       help="Create sample 'domains.txt' file")
-    parser.add_argument("--no-color", action="store_true",
-                       help="Disable colored output")
-    parser.add_argument("-w", "--workers", type=int, default=10,
-                       help="Number of concurrent workers (default: 10)")
-    parser.add_argument("--log-file",
-                       help="Log file path for cron job integration")
-    
+    parser.add_argument("-f", "--file", help="File containing list of domains (one per line)")
+    parser.add_argument("-d", "--domains", nargs='+', help="List of domains to check (space-separated)")
+    parser.add_argument("-c", "--config", help="Custom configuration file path")
+    parser.add_argument("-t", "--threshold", type=int, help=f"Days threshold to consider as expiring soon (default: {DAYS_THRESHOLD})")
+    parser.add_argument("-a", "--alert", type=int, help="Alias for --threshold")
+    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help=f"SSL port to check (default: {DEFAULT_PORT})")
+    parser.add_argument("--create-sample", action="store_true", help="Create sample 'domains.txt' file")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("-w", "--workers", type=int, default=10, help="Number of concurrent workers (default: 10)")
+    parser.add_argument("--log-file", help="Log file path for cron job integration")
+    parser.add_argument("--json", action="store_true", help="Emit results as JSON (disables all decorative output)")
+
     args = parser.parse_args()
-    
-    # Setup logging if specified
+
+    is_tty = sys.stdout.isatty()
+    json_mode = args.json
+    if args.no_color or not is_tty or json_mode:
+        Colors.disable()
+    animate = is_tty and not json_mode
+
     if args.log_file:
         setup_logging(args.log_file)
-    
-    if args.no_color:
-        Colors.disable()
-    
+
     if args.create_sample:
         create_sample_domains_file("domains.txt")
         return
-    
-    # Load configuration
+
     config = load_config(args.config)
-    
-    # Determine threshold (priority: command line > config > default)
+
     threshold = args.threshold if args.threshold is not None else args.alert
     if threshold is None:
         threshold = get_alert_days_from_config(config)
-    
-    # Determine domains to check
+
     domains = []
-    
-    # Priority: command line domains > file > config
     if args.domains:
         domains = args.domains
     elif args.file:
         if not os.path.exists(args.file):
-            print(f"{Colors.RED}❌ Error:{Colors.END} File '{Colors.CYAN}{args.file}{Colors.END}' not found")
+            print(f"{Colors.RED}Error:{Colors.END} File '{args.file}' not found", file=sys.stderr)
             sys.exit(1)
         try:
             with open(args.file, "r") as file:
-                domains = [line.strip() for line in file.readlines() if line.strip()]
+                domains = [line.strip() for line in file if line.strip()]
         except Exception as e:
-            print(f"{Colors.RED}❌ Error reading file:{Colors.END} {e}")
+            print(f"{Colors.RED}Error reading file:{Colors.END} {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        # Try to get domains from config
         domains = parse_domains_from_config(config)
-    
+
     if not domains:
-        print(f"{Colors.RED}❌ Error:{Colors.END} No domains specified")
-        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use -d, --domains, -f, --file, or configure domains in sslcheck.conf")
-        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --create-sample to create an example file")
-        print(f"{Colors.YELLOW}💡 Tip:{Colors.END} Use --help to see available options")
+        print(f"{Colors.RED}Error:{Colors.END} No domains specified", file=sys.stderr)
+        print(f"{Colors.YELLOW}Tip:{Colors.END} Use -d, -f, or configure domains in sslcheck.conf", file=sys.stderr)
+        print(f"{Colors.YELLOW}Tip:{Colors.END} Use --create-sample to create an example file", file=sys.stderr)
         sys.exit(1)
-    
-    # Log the start of the check
+
     if args.log_file:
         logging.info(f"SSL Certificate check started for {len(domains)} domains")
         logging.info(f"Domains: {', '.join(domains)}")
         logging.info(f"Port: {args.port}, Threshold: {threshold} days")
-    
-    print(f"{Colors.BOLD}{Colors.BLUE}🔒 SSL Certificate Checker{Colors.END}")
-    print(f"{Colors.CYAN}📋 Checking {len(domains)} domain(s) on port {args.port}{Colors.END}")
-    print(f"{Colors.YELLOW}⚠️  Warning threshold: {threshold} days{Colors.END}")
-    print(f"{Colors.MAGENTA}👥 Using {args.workers} concurrent workers{Colors.END}")
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    
+
     current_date = datetime.now().date()
-    results = []
-    display_lock = Lock()
-    domain_status = {domain: {'status': 'pending', 'spinner_pos': 0} for domain in domains}
-    
-    def update_display():
-        """Update the display with current status of all domains"""
-        with display_lock:
-            # Calculate current progress
-            remaining = len([d for d in domains if domain_status[d]['status'] == 'pending'])
-            completed = len([d for d in domains if domain_status[d]['status'] in ['completed', 'error']])
-            
-            # Move cursor up to overwrite previous content
-            if hasattr(update_display, 'lines_printed'):
-                # Move cursor up by the number of lines we printed last time
-                print(f"\033[{update_display.lines_printed}A", end="")
-            
-            lines_printed = 0
-            
-            # Show status for all domains
-            for i, domain in enumerate(domains):
-                status_info = domain_status[domain]
-                if status_info['status'] == 'pending':
-                    spinner = SPINNER_CHARS[status_info['spinner_pos'] % len(SPINNER_CHARS)]
-                    print(f"\r{Colors.YELLOW}{spinner}{Colors.END} {domain[:20]:20} checking...{' ' * 20}", end="  ")
-                elif status_info['status'] == 'completed':
-                    print(f"\r{Colors.GREEN}✓{Colors.END} {domain[:20]:20} done{' ' * 23}", end="  ")
-                elif status_info['status'] == 'error':
-                    print(f"\r{Colors.RED}✗{Colors.END} {domain[:20]:20} error{' ' * 22}", end="  ")
-                
-                # New line every 3 domains
-                if (i + 1) % 3 == 0 or i == len(domains) - 1:
-                    print(f"{' ' * 50}")  # Clear rest of line and go to next
-                    lines_printed += 1
-            
-            # Progress summary line
-            progress_text = f"{Colors.CYAN}Progress: {completed}/{len(domains)} domains completed"
-            if remaining > 0:
-                progress_text += f", {remaining} checking..."
+
+    if not json_mode:
+        print(f"{Colors.BOLD}SSL Certificate Checker{Colors.END}")
+        print(f"{Colors.GRAY}{len(domains)} domain(s) · port {args.port} · threshold {threshold}d · {args.workers} workers{Colors.END}")
+        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+
+    state = {d: {'status': 'pending', 'start': time.monotonic(), 'elapsed': None} for d in domains}
+    state_lock = Lock()
+    spinner_pos = [0]
+    lines_rendered = [0]
+    stop_spinner = [False]
+
+    def render_live():
+        """Render status block in-place; called under state_lock."""
+        out = sys.stdout
+        if lines_rendered[0]:
+            out.write(f'\033[{lines_rendered[0]}A')
+        spin = SPINNER_CHARS[spinner_pos[0] % len(SPINNER_CHARS)]
+        count = 0
+        for d in domains:
+            st = state[d]
+            if st['status'] == 'pending':
+                elapsed = time.monotonic() - st['start']
+                line = f"{Colors.YELLOW}{spin}{Colors.END} {d:<45} {Colors.GRAY}checking… {elapsed:>4.1f}s{Colors.END}"
+            elif st['status'] == 'completed':
+                line = f"{Colors.GREEN}✓{Colors.END} {d:<45} {Colors.GRAY}done      {st['elapsed']:>4.1f}s{Colors.END}"
             else:
-                progress_text += f" - All done!"
-            progress_text += f"{Colors.END}"
-            
-            print(f"\r{progress_text}{' ' * 50}")
-            lines_printed += 1
-            
-            # Store the number of lines we printed for next update
-            update_display.lines_printed = lines_printed
-            
-            sys.stdout.flush()
-    
+                line = f"{Colors.RED}✗{Colors.END} {d:<45} {Colors.GRAY}error     {st['elapsed']:>4.1f}s{Colors.END}"
+            out.write(f'\r\033[K{line}\n')
+            count += 1
+        done = sum(1 for d in domains if state[d]['status'] != 'pending')
+        out.write(f'\r\033[K{Colors.CYAN}{done}/{len(domains)} complete{Colors.END}\n')
+        count += 1
+        lines_rendered[0] = count
+        out.flush()
+
+    def mark_done(domain, status):
+        with state_lock:
+            st = state[domain]
+            st['status'] = status
+            st['elapsed'] = time.monotonic() - st['start']
+            if animate:
+                render_live()
+            elif not json_mode:
+                icon = f"{Colors.GREEN}✓{Colors.END}" if status == 'completed' else f"{Colors.RED}✗{Colors.END}"
+                print(f"{icon} {domain} ({st['elapsed']:.1f}s)")
+
     def check_domain(domain):
         expiry_date, error = get_certificate_expiry(domain, args.port)
         if expiry_date:
             days_remaining = (expiry_date - current_date).days
-            domain_status[domain]['status'] = 'completed'
-            update_display()
-            return {
-                'domain': domain,
-                'expiry_date': expiry_date,
-                'days_remaining': days_remaining,
-                'error': None
-            }
-        else:
-            domain_status[domain]['status'] = 'error'
-            update_display()
-            return {
-                'domain': domain,
-                'expiry_date': None,
-                'days_remaining': None,
-                'error': error
-            }
-    
-    def spinner_updater():
-        """Update spinner positions for pending domains"""
-        while any(domain_status[d]['status'] == 'pending' for d in domains):
-            for domain in domains:
-                if domain_status[domain]['status'] == 'pending':
-                    domain_status[domain]['spinner_pos'] += 1
-            update_display()
+            mark_done(domain, 'completed')
+            return {'domain': domain, 'port': args.port, 'expiry_date': expiry_date,
+                    'days_remaining': days_remaining, 'error': None}
+        mark_done(domain, 'error')
+        return {'domain': domain, 'port': args.port, 'expiry_date': None,
+                'days_remaining': None, 'error': error}
+
+    def spinner_ticker():
+        while not stop_spinner[0]:
+            with state_lock:
+                if not any(state[d]['status'] == 'pending' for d in domains):
+                    break
+                spinner_pos[0] += 1
+                render_live()
             time.sleep(0.1)
-    
-    print(f"{Colors.CYAN}🚀 Starting certificate checks...{Colors.END}")
-    print()  # Add space for the status display
-    
-    # Start spinner updater thread
-    spinner_thread = Thread(target=spinner_updater, daemon=True)
-    spinner_thread.start()
-    
-    # Initial display showing all domains
-    update_display()
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        future_to_domain = {executor.submit(check_domain, domain): domain for domain in domains}
-        
-        for future in concurrent.futures.as_completed(future_to_domain):
-            result = future.result()
-            results.append(result)
-    
-    # Clear the status display
-    with display_lock:
-        # Move cursor up and clear the display area
-        if hasattr(update_display, 'lines_printed'):
-            for _ in range(update_display.lines_printed):
-                print(f"\033[1A\033[2K", end="")  # Move up one line and clear it
-    
-    print("\n" + f"{Colors.GRAY}─" * 80+f"{Colors.END}")
-    print(f"{Colors.BOLD}{Colors.BLUE}📊 RESULTS{Colors.END}")
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    
-    valid_count = expired_count = warning_count = error_count = 0
-    
-    # Sort results by days remaining (errors last)
+
+    results = []
+    try:
+        if animate:
+            sys.stdout.write('\033[?25l')
+            sys.stdout.flush()
+            with state_lock:
+                render_live()
+            Thread(target=spinner_ticker, daemon=True).start()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [executor.submit(check_domain, d) for d in domains]
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+        if animate:
+            stop_spinner[0] = True
+            with state_lock:
+                if lines_rendered[0]:
+                    sys.stdout.write(f'\033[{lines_rendered[0]}A')
+                    for _ in range(lines_rendered[0]):
+                        sys.stdout.write('\033[K\n')
+                    sys.stdout.write(f'\033[{lines_rendered[0]}A')
+                    sys.stdout.flush()
+    finally:
+        if animate:
+            sys.stdout.write('\033[?25h')
+            sys.stdout.flush()
+
     results.sort(key=lambda x: (x['error'] is not None, x['days_remaining'] if x['days_remaining'] is not None else -999))
-    
-    for result in results:
-        domain = result['domain']
-        if result['error']:
-            print(f"{Colors.RED}❌ {domain:30}{Colors.END} {Colors.RED}ERROR{Colors.END:20} {result['error'][:50]}")
-            error_count += 1
+
+    valid_count = warning_count = expired_count = error_count = 0
+    for r in results:
+        c = classify(r['days_remaining'], r['error'], threshold)
+        if c == 'valid':
+            valid_count += 1
+        elif c == 'expiring':
+            warning_count += 1
+        elif c == 'expired':
+            expired_count += 1
         else:
-            days_remaining = result['days_remaining']
-            expiry_date = result['expiry_date']
-            
-            if days_remaining <= 0:
-                status_color = Colors.RED
-                status_icon = "🔴"
-                status_text = "EXPIRED"
-                expired_count += 1
-            elif days_remaining <= threshold:
-                status_color = Colors.YELLOW
-                status_icon = "🟡"
-                status_text = "EXPIRING SOON"
-                warning_count += 1
-            else:
-                status_color = Colors.GREEN
-                status_icon = "🟢"
-                status_text = "VALID"
-                valid_count += 1
-            
-            print(f"{status_icon} {domain:30} {status_color}{status_text:15}{Colors.END} Expires: {expiry_date} ({days_remaining} days)")
-    
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    
-    # Calculate percentages
-    total = len(domains)
-    valid_pct = (valid_count / total * 100) if total > 0 else 0
-    warning_pct = (warning_count / total * 100) if total > 0 else 0
-    expired_pct = (expired_count / total * 100) if total > 0 else 0
-    error_pct = (error_count / total * 100) if total > 0 else 0
-    
-    print(f"{Colors.BOLD}{Colors.CYAN}📊 CERTIFICATE HEALTH SUMMARY{Colors.END}")
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    
-    # Status bars
-    def create_status_bar(count, total, color):
-        if total == 0:
-            return ""
-        bar_length = 40
-        filled_length = int(bar_length * count / total)
-        bar = "█" * filled_length + "░" * (bar_length - filled_length)
-        return f"{color}[{bar}]{Colors.END}"
-    
-    if valid_count > 0:
-        bar = create_status_bar(valid_count, total, Colors.GREEN)
-        print(f"{Colors.GREEN}🟢 VALID CERTIFICATES{Colors.END:30}    {valid_count:3d} / {total:<3d} ({valid_pct:5.1f}%)")
-        print(f"   {bar}")
-        print()
-    
-    if warning_count > 0:
-        bar = create_status_bar(warning_count, total, Colors.YELLOW)
-        print(f"{Colors.YELLOW}🟡 EXPIRING SOON{Colors.END:30}         {warning_count:3d} / {total:<3d} ({warning_pct:5.1f}%)")
-        print(f"   {bar}")
-        print()
-    
-    if expired_count > 0:
-        bar = create_status_bar(expired_count, total, Colors.RED)
-        print(f"{Colors.RED}🔴 EXPIRED CERTIFICATES{Colors.END:30}   {expired_count:3d} / {total:<3d} ({expired_pct:5.1f}%)")
-        print(f"   {bar}")
-        print()
-    
-    if error_count > 0:
-        bar = create_status_bar(error_count, total, Colors.RED)
-        print(f"{Colors.RED}❌ CONNECTION ERRORS{Colors.END:30}      {error_count:3d} / {total:<3d} ({error_pct:5.1f}%)")
-        print(f"   {bar}")
-        print()
-    
-    # Overall health indicator
-    if expired_count > 0 or error_count > 0:
-        health_status = f"{Colors.RED}🚨 ATTENTION REQUIRED{Colors.END}"
-    elif warning_count > 0:
-        health_status = f"{Colors.YELLOW}⚠️  MONITORING NEEDED{Colors.END}"
+            error_count += 1
+
+    if json_mode:
+        payload = [{
+            'domain': r['domain'],
+            'port': r['port'],
+            'status': classify(r['days_remaining'], r['error'], threshold),
+            'expiry_date': r['expiry_date'].isoformat() if r['expiry_date'] else None,
+            'days_remaining': r['days_remaining'],
+            'error': r['error'],
+        } for r in results]
+        print(json.dumps(payload, indent=2))
     else:
-        health_status = f"{Colors.GREEN}✅ ALL CERTIFICATES HEALTHY{Colors.END}"
-    
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    print(f"{Colors.BOLD}OVERALL STATUS: {health_status}{Colors.END}")
-    print(f"{Colors.GRAY}{'─' * 80}{Colors.END}")
-    
-    # Log the results
-    if args.log_file:
-        logging.info(f"SSL Certificate check completed")
-        logging.info(f"Results: {valid_count} valid, {warning_count} expiring soon, {expired_count} expired, {error_count} errors")
-        
-        # Log details for problematic certificates
-        for result in results:
-            if result['error']:
-                logging.error(f"{result['domain']}: {result['error']}")
-            elif result['days_remaining'] is not None:
-                if result['days_remaining'] <= 0:
-                    logging.critical(f"{result['domain']}: Certificate EXPIRED on {result['expiry_date']}")
-                elif result['days_remaining'] <= threshold:
-                    logging.warning(f"{result['domain']}: Certificate expires in {result['days_remaining']} days on {result['expiry_date']}")
+        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+        print(f"{Colors.BOLD}Results{Colors.END}")
+        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+        for r in results:
+            domain = r['domain']
+            if r['error']:
+                print(f"{Colors.RED}✗{Colors.END} {domain:<35} {Colors.RED}{'ERROR':<10}{Colors.END} {Colors.GRAY}{r['error'][:50]}{Colors.END}")
+            else:
+                days = r['days_remaining']
+                if days <= 0:
+                    color, icon, text = Colors.RED, '🔴', 'EXPIRED'
+                elif days <= threshold:
+                    color, icon, text = Colors.YELLOW, '🟡', 'EXPIRING'
                 else:
-                    logging.info(f"{result['domain']}: Certificate valid for {result['days_remaining']} days (expires {result['expiry_date']})")
+                    color, icon, text = Colors.GREEN, '🟢', 'VALID'
+                print(f"{icon} {domain:<35} {color}{text:<10}{Colors.END} {Colors.GRAY}expires {r['expiry_date']} ({days}d){Colors.END}")
+        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+
+        total = len(domains)
+        bar_width = 30
+
+        def bar(count, color):
+            filled = int(bar_width * count / total) if total else 0
+            return f"{color}{'█' * filled}{Colors.GRAY}{'░' * (bar_width - filled)}{Colors.END}"
+
+        print(f"{Colors.BOLD}Summary{Colors.END}")
+        if valid_count:
+            print(f"  {Colors.GREEN}valid    {Colors.END} {bar(valid_count, Colors.GREEN)}  {valid_count}/{total}")
+        if warning_count:
+            print(f"  {Colors.YELLOW}expiring {Colors.END} {bar(warning_count, Colors.YELLOW)}  {warning_count}/{total}")
+        if expired_count:
+            print(f"  {Colors.RED}expired  {Colors.END} {bar(expired_count, Colors.RED)}  {expired_count}/{total}")
+        if error_count:
+            print(f"  {Colors.RED}errors   {Colors.END} {bar(error_count, Colors.RED)}  {error_count}/{total}")
+        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+
+        if expired_count or error_count:
+            print(f"{Colors.RED}✗ attention required{Colors.END}")
+        elif warning_count:
+            print(f"{Colors.YELLOW}! monitoring needed{Colors.END}")
+        else:
+            print(f"{Colors.GREEN}✓ all certificates healthy{Colors.END}")
+
+    if args.log_file:
+        logging.info("SSL Certificate check completed")
+        logging.info(f"Results: {valid_count} valid, {warning_count} expiring soon, {expired_count} expired, {error_count} errors")
+        for r in results:
+            if r['error']:
+                logging.error(f"{r['domain']}: {r['error']}")
+            elif r['days_remaining'] is not None:
+                if r['days_remaining'] <= 0:
+                    logging.critical(f"{r['domain']}: Certificate EXPIRED on {r['expiry_date']}")
+                elif r['days_remaining'] <= threshold:
+                    logging.warning(f"{r['domain']}: Certificate expires in {r['days_remaining']} days on {r['expiry_date']}")
+                else:
+                    logging.info(f"{r['domain']}: Certificate valid for {r['days_remaining']} days (expires {r['expiry_date']})")
 
     sys.exit(1 if expired_count or error_count else 0)
 
+
 if __name__ == "__main__":
     main()
-
