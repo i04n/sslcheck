@@ -19,16 +19,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from datetime import datetime
-import OpenSSL
 import ssl
+import socket
 import argparse
 import sys
 import os
 import time
 from threading import Thread, Lock
-from queue import Queue
 import concurrent.futures
-import itertools
 import configparser
 import logging
 
@@ -134,13 +132,13 @@ def setup_logging(log_file=None):
 
 def get_certificate_expiry(domain, port=DEFAULT_PORT):
     try:
-        cert = ssl.get_server_certificate((domain, port))
-        x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, cert)
-        bytes_expiry = x509.get_notAfter()
-        timestamp = bytes_expiry.decode('utf-8')
-        expiry_date = datetime.strptime(timestamp, '%Y%m%d%H%M%S%z').date()
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, port), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+        expiry_date = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z').date()
         return expiry_date, None
-    except (ssl.SSLError, OpenSSL.crypto.Error, ValueError, ConnectionError, OSError) as e:
+    except (ssl.SSLError, socket.timeout, ConnectionError, OSError, ValueError, KeyError) as e:
         return None, str(e)
 
 def create_sample_domains_file(filename):
@@ -210,7 +208,7 @@ def main():
     config = load_config(args.config)
     
     # Determine threshold (priority: command line > config > default)
-    threshold = args.threshold or args.alert
+    threshold = args.threshold if args.threshold is not None else args.alert
     if threshold is None:
         threshold = get_alert_days_from_config(config)
     
@@ -305,28 +303,26 @@ def main():
             sys.stdout.flush()
     
     def check_domain(domain):
-        result = get_certificate_expiry(domain, args.port)
-        if len(result) == 2:
-            expiry_date, error = result
-            if expiry_date:
-                days_remaining = (expiry_date - current_date).days
-                domain_status[domain]['status'] = 'completed'
-                update_display()
-                return {
-                    'domain': domain,
-                    'expiry_date': expiry_date,
-                    'days_remaining': days_remaining,
-                    'error': None
-                }
-            else:
-                domain_status[domain]['status'] = 'error'
-                update_display()
-                return {
-                    'domain': domain,
-                    'expiry_date': None,
-                    'days_remaining': None,
-                    'error': error
-                }
+        expiry_date, error = get_certificate_expiry(domain, args.port)
+        if expiry_date:
+            days_remaining = (expiry_date - current_date).days
+            domain_status[domain]['status'] = 'completed'
+            update_display()
+            return {
+                'domain': domain,
+                'expiry_date': expiry_date,
+                'days_remaining': days_remaining,
+                'error': None
+            }
+        else:
+            domain_status[domain]['status'] = 'error'
+            update_display()
+            return {
+                'domain': domain,
+                'expiry_date': None,
+                'days_remaining': None,
+                'error': error
+            }
     
     def spinner_updater():
         """Update spinner positions for pending domains"""
@@ -470,6 +466,8 @@ def main():
                     logging.warning(f"{result['domain']}: Certificate expires in {result['days_remaining']} days on {result['expiry_date']}")
                 else:
                     logging.info(f"{result['domain']}: Certificate valid for {result['days_remaining']} days (expires {result['expiry_date']})")
+
+    sys.exit(1 if expired_count or error_count else 0)
 
 if __name__ == "__main__":
     main()

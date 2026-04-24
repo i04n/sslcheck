@@ -5,7 +5,7 @@ A modern, colorful command-line tool to monitor SSL certificate expiration for m
 ## 🚀 **Single-File Simplicity**
 
 - **📁 One file only** - Everything in a single `sslcheck.py` script
-- **📦 Minimal dependencies** - Only requires `pyOpenSSL` (plus Python standard library)
+- **📦 Zero dependencies** - Uses only the Python standard library
 - **⚡ Zero configuration** - Works out of the box
 - **🔧 Easy deployment** - Just copy the file and run!
 
@@ -29,25 +29,20 @@ A modern, colorful command-line tool to monitor SSL certificate expiration for m
 # 1. Download the single file
 wget https://raw.githubusercontent.com/i04n/sslcheck/main/sslcheck.py
 
-# 2. Install the only dependency
-pip install pyOpenSSL
-
-# 3. Rename and make it executable
+# 2. Rename and make it executable
 mv sslcheck.py sslcheck
 chmod +x sslcheck
 
-# 4. Ready to use!
+# 3. Ready to use!
 ./sslcheck --create-sample
 
-# 5. (Optional) Move to PATH for global access
+# 4. (Optional) Move to PATH for global access
 sudo mv sslcheck /usr/local/bin/
 sslcheck --help
 ```
 
 ### Prerequisites
-- **Python 3.6+** (standard library modules included)
-- **pyOpenSSL** - The only external dependency for certificate parsing
-- That's it! 🎉
+- **Python 3.6+** — that's it, no external packages required 🎉
 
 ## 📋 Usage
 
@@ -143,12 +138,6 @@ domains = example.com, google.com, github.com
 
 # Days before expiration to trigger alerts
 alert_days = 30
-
-# Default port to check (optional, default is 443)
-# port = 443
-
-# Number of concurrent workers (optional, default is 10)
-# workers = 10
 ```
 
 #### Configuration Priority
@@ -222,8 +211,8 @@ Progress: [███████████████████████
 
 ## 📊 Exit Codes
 
-- `0`: Success
-- `1`: Error (missing file, invalid arguments, etc.)
+- `0`: All certificates valid (including those merely expiring soon)
+- `1`: At least one certificate is expired or could not be checked (connection/SSL error), or invalid invocation (missing file, bad arguments, etc.)
 
 ## 🤝 Contributing
 
