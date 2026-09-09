@@ -66,19 +66,33 @@ CONNECT_TIMEOUT = 10
 
 SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
+DOT = '●'
+INDENT = '  '
+
+STATUS_STYLE = {
+    'valid':     (lambda: Colors.GREEN,   'valid'),
+    'expiring':  (lambda: Colors.YELLOW,  'expiring'),
+    'untrusted': (lambda: Colors.MAGENTA, 'untrusted'),
+    'expired':   (lambda: Colors.RED,     'expired'),
+    'error':     (lambda: Colors.RED,     'error'),
+}
+
 
 def load_config(config_file=None):
-    """Load configuration from file"""
+    """Load configuration.
+
+    An explicit --config replaces the default search path entirely, so the
+    file the user named is the file that is used. Otherwise ./sslcheck.conf
+    wins over ~/sslcheck.conf.
+    """
     config = configparser.ConfigParser()
-    config_files = []
     if config_file:
-        config_files.append(config_file)
-    home_config = os.path.expanduser('~/sslcheck.conf')
-    if os.path.exists(home_config):
-        config_files.append(home_config)
-    local_config = 'sslcheck.conf'
-    if os.path.exists(local_config):
-        config_files.append(local_config)
+        config_files = [config_file]
+    else:
+        config_files = [
+            path for path in (os.path.expanduser('~/sslcheck.conf'), 'sslcheck.conf')
+            if os.path.exists(path)
+        ]
     if config_files:
         config.read(config_files)
         return config
@@ -160,21 +174,40 @@ def _extract_not_after(der):
     raise ValueError(f"unexpected time tag 0x{tag:02x}")
 
 
-def get_certificate_expiry(domain, port=DEFAULT_PORT):
+def build_context(ca_file=None, ca_path=None):
+    """Verifying context trusting the system store plus any extra anchors.
+
+    load_verify_locations() adds to the default store rather than replacing it,
+    so a mixed inventory of public and internal-PKI hosts validates in one run.
+    """
+    context = ssl.create_default_context()
+    if ca_file or ca_path:
+        context.load_verify_locations(cafile=ca_file, capath=ca_path)
+    return context
+
+
+def get_certificate_expiry(domain, port=DEFAULT_PORT, ca_file=None, ca_path=None):
+    """Return (expiry_date, error, validation_error).
+
+    error            — no certificate could be read at all (network/protocol).
+    validation_error — a certificate was read but failed chain validation
+                       (self-signed, untrusted CA, hostname mismatch, expired).
+    """
     try:
-        context = ssl.create_default_context()
+        context = build_context(ca_file, ca_path)
         with socket.create_connection((domain, port), timeout=CONNECT_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-        return datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z').date(), None
-    except ssl.SSLCertVerificationError:
-        pass  # fall through — retry unverified so we can still read notAfter
+        return datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z').date(), None, None
+    except ssl.SSLCertVerificationError as e:
+        # Fall through — retry unverified so we can still read notAfter, but
+        # keep why validation failed: an unverifiable cert is never "valid".
+        validation_error = getattr(e, 'verify_message', None) or str(e)
     except (ssl.SSLError, socket.timeout, ConnectionError, OSError, ValueError, KeyError) as e:
-        return None, str(e)
+        return None, str(e), None
 
-    # Verification failed (expired / self-signed / hostname mismatch / untrusted CA).
     # Fetch the raw DER without validation and parse notAfter so we can report
-    # EXPIRED/EXPIRING instead of a generic error.
+    # EXPIRED/UNTRUSTED with a real date instead of a generic error.
     try:
         context = ssl.create_default_context()
         context.check_hostname = False
@@ -183,10 +216,10 @@ def get_certificate_expiry(domain, port=DEFAULT_PORT):
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 der = ssock.getpeercert(binary_form=True)
         if not der:
-            return None, "server presented no certificate"
-        return _extract_not_after(der), None
+            return None, "server presented no certificate", None
+        return _extract_not_after(der), None, validation_error
     except (ssl.SSLError, socket.timeout, ConnectionError, OSError, ValueError, KeyError, IndexError) as e:
-        return None, str(e)
+        return None, str(e), validation_error
 
 
 def create_sample_domains_file(filename):
@@ -194,14 +227,16 @@ def create_sample_domains_file(filename):
     with open(filename, "w") as file:
         for domain in sample_domains:
             file.write(f"{domain}\n")
-    print(f"{Colors.GREEN}✓{Colors.END} Sample domains file created: {Colors.CYAN}{filename}{Colors.END}")
+    print(f"{INDENT}{Colors.GREEN}✓{Colors.END} wrote {Colors.BOLD}{filename}{Colors.END} {Colors.GRAY}({len(sample_domains)} domains){Colors.END}")
 
 
-def classify(days_remaining, error, threshold):
+def classify(days_remaining, error, validation_error, threshold, allow_untrusted=False):
     if error:
         return 'error'
     if days_remaining <= 0:
         return 'expired'
+    if validation_error and not allow_untrusted:
+        return 'untrusted'
     if days_remaining <= threshold:
         return 'expiring'
     return 'valid'
@@ -221,6 +256,8 @@ Examples:
   sslcheck -d example.com --json | jq '.[] | select(.days_remaining < 30)'
   sslcheck --create-sample
   sslcheck -f domains.txt --log-file /var/log/sslcheck.log
+  sslcheck -f internal.txt --ca-file /etc/pki/internal-ca.pem
+  sslcheck -f appliances.txt --allow-untrusted
         """
     )
     parser.add_argument("-f", "--file", help="File containing list of domains (one per line)")
@@ -234,8 +271,33 @@ Examples:
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of concurrent workers (default: 10)")
     parser.add_argument("--log-file", help="Log file path for cron job integration")
     parser.add_argument("--json", action="store_true", help="Emit results as JSON (disables all decorative output)")
+    parser.add_argument("--ca-file", help="Extra CA bundle (PEM) to trust, in addition to the system store")
+    parser.add_argument("--ca-path", help="Directory of extra trusted CA certificates (OpenSSL hashed dir)")
+    parser.add_argument("--allow-untrusted", action="store_true",
+                        help="Treat certificates that fail chain validation as VALID with a warning "
+                             "instead of UNTRUSTED (keeps exit 0; for internal PKI and appliances)")
 
     args = parser.parse_args()
+
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    for name, value in (("--threshold", args.threshold), ("--alert", args.alert)):
+        if value is not None and value < 0:
+            parser.error(f"{name} must not be negative")
+    if args.config and not os.path.exists(args.config):
+        parser.error(f"config file '{args.config}' not found")
+    if args.ca_file and not os.path.isfile(args.ca_file):
+        parser.error(f"CA file '{args.ca_file}' not found")
+    if args.ca_path and not os.path.isdir(args.ca_path):
+        parser.error(f"CA directory '{args.ca_path}' not found")
+    if args.ca_file or args.ca_path:
+        # Fail fast on an unreadable/malformed bundle rather than once per worker.
+        try:
+            build_context(args.ca_file, args.ca_path)
+        except (ssl.SSLError, OSError) as e:
+            parser.error(f"could not load CA certificates: {e}")
 
     is_tty = sys.stdout.isatty()
     json_mode = args.json
@@ -261,21 +323,21 @@ Examples:
         domains = args.domains
     elif args.file:
         if not os.path.exists(args.file):
-            print(f"{Colors.RED}Error:{Colors.END} File '{args.file}' not found", file=sys.stderr)
+            print(f"{INDENT}{Colors.RED}Error:{Colors.END} file '{args.file}' not found", file=sys.stderr)
             sys.exit(1)
         try:
             with open(args.file, "r") as file:
                 domains = [line.strip() for line in file if line.strip()]
         except Exception as e:
-            print(f"{Colors.RED}Error reading file:{Colors.END} {e}", file=sys.stderr)
+            print(f"{INDENT}{Colors.RED}Error:{Colors.END} could not read '{args.file}': {e}", file=sys.stderr)
             sys.exit(1)
     else:
         domains = parse_domains_from_config(config)
 
     if not domains:
-        print(f"{Colors.RED}Error:{Colors.END} No domains specified", file=sys.stderr)
-        print(f"{Colors.YELLOW}Tip:{Colors.END} Use -d, -f, or configure domains in sslcheck.conf", file=sys.stderr)
-        print(f"{Colors.YELLOW}Tip:{Colors.END} Use --create-sample to create an example file", file=sys.stderr)
+        print(f"{INDENT}{Colors.RED}Error:{Colors.END} no domains specified", file=sys.stderr)
+        print(f"{INDENT}{Colors.GRAY}Pass -d <domain>, -f <file>, or set domains in sslcheck.conf.{Colors.END}", file=sys.stderr)
+        print(f"{INDENT}{Colors.GRAY}Run --create-sample to write an example file.{Colors.END}", file=sys.stderr)
         sys.exit(1)
 
     if args.log_file:
@@ -285,10 +347,13 @@ Examples:
 
     current_date = datetime.now().date()
 
+    started = time.monotonic()
+    name_width = min(max(len(d) for d in domains), 44)
+
     if not json_mode:
-        print(f"{Colors.BOLD}SSL Certificate Checker{Colors.END}")
-        print(f"{Colors.GRAY}{len(domains)} domain(s) · port {args.port} · threshold {threshold}d · {args.workers} workers{Colors.END}")
-        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+        meta = f"{len(domains)} domain{'s' if len(domains) != 1 else ''} · port {args.port} · threshold {threshold}d"
+        print(f"{INDENT}{Colors.BOLD}sslcheck{Colors.END} {Colors.GRAY}{meta}{Colors.END}")
+        print()
 
     state = {d: {'status': 'pending', 'start': time.monotonic(), 'elapsed': None} for d in domains}
     state_lock = Lock()
@@ -307,15 +372,17 @@ Examples:
             st = state[d]
             if st['status'] == 'pending':
                 elapsed = time.monotonic() - st['start']
-                line = f"{Colors.YELLOW}{spin}{Colors.END} {d:<45} {Colors.GRAY}checking… {elapsed:>4.1f}s{Colors.END}"
+                glyph, label = f"{Colors.GRAY}{spin}", 'checking'
             elif st['status'] == 'completed':
-                line = f"{Colors.GREEN}✓{Colors.END} {d:<45} {Colors.GRAY}done      {st['elapsed']:>4.1f}s{Colors.END}"
+                elapsed, glyph, label = st['elapsed'], f"{Colors.GREEN}{DOT}", 'done'
             else:
-                line = f"{Colors.RED}✗{Colors.END} {d:<45} {Colors.GRAY}error     {st['elapsed']:>4.1f}s{Colors.END}"
+                elapsed, glyph, label = st['elapsed'], f"{Colors.RED}{DOT}", 'failed'
+            line = (f"{INDENT}{glyph}{Colors.END} {d:<{name_width}}  "
+                    f"{Colors.GRAY}{label:<9}{elapsed:>4.1f}s{Colors.END}")
             out.write(f'\r\033[K{line}\n')
             count += 1
         done = sum(1 for d in domains if state[d]['status'] != 'pending')
-        out.write(f'\r\033[K{Colors.CYAN}{done}/{len(domains)} complete{Colors.END}\n')
+        out.write(f'\r\033[K{INDENT}{Colors.GRAY}{done} of {len(domains)} checked{Colors.END}\n')
         count += 1
         lines_rendered[0] = count
         out.flush()
@@ -328,19 +395,23 @@ Examples:
             if animate:
                 render_live()
             elif not json_mode:
-                icon = f"{Colors.GREEN}✓{Colors.END}" if status == 'completed' else f"{Colors.RED}✗{Colors.END}"
-                print(f"{icon} {domain} ({st['elapsed']:.1f}s)")
+                color = Colors.GREEN if status == 'completed' else Colors.RED
+                print(f"{INDENT}{color}{DOT}{Colors.END} {domain:<{name_width}}  "
+                      f"{Colors.GRAY}{st['elapsed']:.1f}s{Colors.END}")
 
     def check_domain(domain):
-        expiry_date, error = get_certificate_expiry(domain, args.port)
+        expiry_date, error, validation_error = get_certificate_expiry(
+            domain, args.port, args.ca_file, args.ca_path)
         if expiry_date:
             days_remaining = (expiry_date - current_date).days
-            mark_done(domain, 'completed')
+            mark_done(domain, 'completed' if not validation_error or args.allow_untrusted else 'error')
             return {'domain': domain, 'port': args.port, 'expiry_date': expiry_date,
-                    'days_remaining': days_remaining, 'error': None}
+                    'days_remaining': days_remaining, 'error': None,
+                    'validation_error': validation_error}
         mark_done(domain, 'error')
         return {'domain': domain, 'port': args.port, 'expiry_date': None,
-                'days_remaining': None, 'error': error}
+                'days_remaining': None, 'error': error,
+                'validation_error': validation_error}
 
     def spinner_ticker():
         while not stop_spinner[0]:
@@ -374,6 +445,8 @@ Examples:
                         sys.stdout.write('\033[K\n')
                     sys.stdout.write(f'\033[{lines_rendered[0]}A')
                     sys.stdout.flush()
+        elif not json_mode:
+            print()
     finally:
         if animate:
             sys.stdout.write('\033[?25h')
@@ -381,87 +454,96 @@ Examples:
 
     results.sort(key=lambda x: (x['error'] is not None, x['days_remaining'] if x['days_remaining'] is not None else -999))
 
-    valid_count = warning_count = expired_count = error_count = 0
+    valid_count = warning_count = untrusted_count = expired_count = error_count = 0
     for r in results:
-        c = classify(r['days_remaining'], r['error'], threshold)
-        if c == 'valid':
+        r['status'] = classify(r['days_remaining'], r['error'], r['validation_error'],
+                               threshold, args.allow_untrusted)
+        if r['status'] == 'valid':
             valid_count += 1
-        elif c == 'expiring':
+        elif r['status'] == 'expiring':
             warning_count += 1
-        elif c == 'expired':
+        elif r['status'] == 'untrusted':
+            untrusted_count += 1
+        elif r['status'] == 'expired':
             expired_count += 1
         else:
             error_count += 1
+    unverified_count = sum(
+        1 for r in results if r['validation_error'] and r['status'] not in ('untrusted', 'expired')
+    )
 
     if json_mode:
         payload = [{
             'domain': r['domain'],
             'port': r['port'],
-            'status': classify(r['days_remaining'], r['error'], threshold),
+            'status': r['status'],
             'expiry_date': r['expiry_date'].isoformat() if r['expiry_date'] else None,
             'days_remaining': r['days_remaining'],
+            'verified': r['error'] is None and r['validation_error'] is None,
+            'validation_error': r['validation_error'],
             'error': r['error'],
         } for r in results]
         print(json.dumps(payload, indent=2))
     else:
-        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
-        print(f"{Colors.BOLD}Results{Colors.END}")
-        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
         for r in results:
-            domain = r['domain']
+            color_fn, label = STATUS_STYLE[r['status']]
+            color = color_fn()
+            row = f"{INDENT}{color}{DOT}{Colors.END} {r['domain']:<{name_width}}  {color}{label:<10}{Colors.END}"
             if r['error']:
-                print(f"{Colors.RED}✗{Colors.END} {domain:<35} {Colors.RED}{'ERROR':<10}{Colors.END} {Colors.GRAY}{r['error'][:50]}{Colors.END}")
-            else:
-                days = r['days_remaining']
-                if days <= 0:
-                    color, icon, text = Colors.RED, '🔴', 'EXPIRED'
-                elif days <= threshold:
-                    color, icon, text = Colors.YELLOW, '🟡', 'EXPIRING'
-                else:
-                    color, icon, text = Colors.GREEN, '🟢', 'VALID'
-                print(f"{icon} {domain:<35} {color}{text:<10}{Colors.END} {Colors.GRAY}expires {r['expiry_date']} ({days}d){Colors.END}")
-        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
+                print(f"{row} {Colors.GRAY}{'':<24}{r['error'][:56]}{Colors.END}")
+                continue
+            days = r['days_remaining']
+            when = f"{days}d left" if days > 0 else f"{-days}d ago"
+            note = ''
+            if r['validation_error'] and r['status'] != 'expired':
+                mark = '' if r['status'] == 'untrusted' else '⚠ '
+                note = f"{mark}{r['validation_error'][:44]}"
+            detail = f"{str(r['expiry_date']):<12}{when:<11}{note}".rstrip()
+            print(f"{row} {Colors.GRAY}{detail}{Colors.END}")
 
-        total = len(domains)
-        bar_width = 30
+        print()
+        tally = [
+            (valid_count, 'valid', Colors.GREEN),
+            (warning_count, 'expiring', Colors.YELLOW),
+            (untrusted_count, 'untrusted', Colors.MAGENTA),
+            (expired_count, 'expired', Colors.RED),
+            (error_count, 'error' if error_count == 1 else 'errors', Colors.RED),
+        ]
+        parts = [f"{color}{count} {label}{Colors.END}" for count, label, color in tally if count]
+        print(f"{INDENT}{f'{Colors.GRAY} · {Colors.END}'.join(parts)}")
+        if unverified_count:
+            print(f"{INDENT}{Colors.YELLOW}{unverified_count} unverified{Colors.END} "
+                  f"{Colors.GRAY}· reported valid via --allow-untrusted{Colors.END}")
 
-        def bar(count, color):
-            filled = int(bar_width * count / total) if total else 0
-            return f"{color}{'█' * filled}{Colors.GRAY}{'░' * (bar_width - filled)}{Colors.END}"
-
-        print(f"{Colors.BOLD}Summary{Colors.END}")
-        if valid_count:
-            print(f"  {Colors.GREEN}valid    {Colors.END} {bar(valid_count, Colors.GREEN)}  {valid_count}/{total}")
-        if warning_count:
-            print(f"  {Colors.YELLOW}expiring {Colors.END} {bar(warning_count, Colors.YELLOW)}  {warning_count}/{total}")
-        if expired_count:
-            print(f"  {Colors.RED}expired  {Colors.END} {bar(expired_count, Colors.RED)}  {expired_count}/{total}")
-        if error_count:
-            print(f"  {Colors.RED}errors   {Colors.END} {bar(error_count, Colors.RED)}  {error_count}/{total}")
-        print(f"{Colors.GRAY}{'─' * 72}{Colors.END}")
-
-        if expired_count or error_count:
-            print(f"{Colors.RED}✗ attention required{Colors.END}")
-        elif warning_count:
-            print(f"{Colors.YELLOW}! monitoring needed{Colors.END}")
+        needs_attention = expired_count + untrusted_count + error_count
+        if needs_attention:
+            noun, verb = ('domain', 'needs') if needs_attention == 1 else ('domains', 'need')
+            print(f"{INDENT}{Colors.RED}✗{Colors.END} {needs_attention} {noun} {verb} attention")
+        elif warning_count or unverified_count:
+            print(f"{INDENT}{Colors.YELLOW}!{Colors.END} monitoring needed")
         else:
-            print(f"{Colors.GREEN}✓ all certificates healthy{Colors.END}")
+            print(f"{INDENT}{Colors.GREEN}✓{Colors.END} all certificates valid")
+        print(f"{INDENT}{Colors.GRAY}Done in {time.monotonic() - started:.1f}s{Colors.END}")
 
     if args.log_file:
         logging.info("SSL Certificate check completed")
-        logging.info(f"Results: {valid_count} valid, {warning_count} expiring soon, {expired_count} expired, {error_count} errors")
+        logging.info(f"Results: {valid_count} valid, {warning_count} expiring soon, {untrusted_count} untrusted, {expired_count} expired, {error_count} errors, {unverified_count} unverified")
         for r in results:
             if r['error']:
                 logging.error(f"{r['domain']}: {r['error']}")
             elif r['days_remaining'] is not None:
-                if r['days_remaining'] <= 0:
+                if r['status'] == 'expired':
                     logging.critical(f"{r['domain']}: Certificate EXPIRED on {r['expiry_date']}")
+                elif r['status'] == 'untrusted':
+                    logging.critical(f"{r['domain']}: Certificate FAILED validation ({r['validation_error']}), expires {r['expiry_date']}")
+                elif r['validation_error']:
+                    logging.warning(f"{r['domain']}: Certificate unverified ({r['validation_error']}), expires {r['expiry_date']} in {r['days_remaining']} days")
                 elif r['days_remaining'] <= threshold:
                     logging.warning(f"{r['domain']}: Certificate expires in {r['days_remaining']} days on {r['expiry_date']}")
                 else:
                     logging.info(f"{r['domain']}: Certificate valid for {r['days_remaining']} days (expires {r['expiry_date']})")
 
-    sys.exit(1 if expired_count or error_count else 0)
+    sys.exit(1 if expired_count or error_count or untrusted_count else 0)
 
 
 if __name__ == "__main__":
